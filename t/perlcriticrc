@@ -1,0 +1,17 @@
+severity = harsh
+
+# RequireArgUnpacking
+#     Doesn't allow for using shift to get $self and then using @_ with named params
+# ProhibitImplicitNewlines 
+#     Doesn't allow for q|| blocks.
+# ProhibitManyArgs
+#     Sometimes it is good to have too many arguments.
+# RequireBriefOpen 
+#     File handles need to be opened basically forever in this program.
+exclude = RequireArgUnpacking ProhibitImplicitNewlines ProhibitManyArgs RequireBriefOpen
+
+[Subroutines::ProhibitExcessComplexity]
+max_mccabe = 30
+
+[RegularExpressions::ProhibitComplexRegexes]
+max_characters = 100

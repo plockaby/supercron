@@ -1,0 +1,590 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings FATAL => 'all';
+
+use version;
+our $VERSION = "1.00";
+
+use IO::Handle;
+use Getopt::Long;
+use Pod::Usage;
+use Try::Tiny;
+
+sub main {
+    my %args = @_;
+
+    my $configuration = $args{'configuration'};
+    my $debug         = $args{'debug'};
+
+    return try {
+        # make sure we're running in supervisor
+        die "supercron must be run as a supervisor event monitor\n" unless $ENV{'SUPERVISOR_SERVER_URL'};
+
+        # set our name for quick find in ps
+        local $0 = "supercron";
+
+        # disable output buffering
+        STDOUT->autoflush(1);
+        STDERR->autoflush(1);
+
+        my $listener = Local::App->new(
+            'debug'         => $debug,
+            'api'           => $ENV{'SUPERVISOR_SERVER_URL'} . '/RPC2',
+            'configuration' => $configuration,
+        );
+        return $listener->run();
+    } catch {
+        my $error = (defined($_) ? $_ : "unknown error");
+        chomp($error);
+        warn "error running $0: ${error}\n";
+        return 1;
+    };
+}
+
+unless (caller) {
+    my %options = ();
+    GetOptions(
+        \%options,
+        "configuration=s",
+        "debug",
+        "help",
+    );
+    pod2usage({ '-verbose' => 99 }) if $options{'help'};
+
+    # check for required arguments
+    pod2usage({ '-verbose' => 1, '-message' => "missing --configuration argument" }) unless $options{'configuration'};
+
+    exit(main(%options));
+}
+
+package Local::App;
+
+use strict;
+use warnings FATAL => 'all';
+
+use Try::Tiny;
+use XML::RPC;
+use IO::Handle;
+use Time::Piece;
+use Time::Local ();
+use Schedule::Cron::Events;
+use Data::Dumper ();
+use File::Spec;
+use Cwd ();
+
+sub new {
+    my $class = shift;
+    my %args = @_;
+
+    my $api = $args{'api'};
+    if ($api && $api =~ /^(unix:|http:)/x) {
+        if ($api =~ /^unix:\/\/(.*)\/RPC2$/x) {
+            my $socket = $1;
+
+            $api = try {
+                require LWP::Protocol;
+                require LWP::Protocol::http::SocketUnixAlt;
+                LWP::Protocol::implementor('http' => 'LWP::Protocol::http::SocketUnixAlt');
+
+                # the api will look something like this: http:/var/run/supervisor/supervisord.sock//RPC2
+                return "http:${socket}//RPC2";
+            } catch {
+                die "cannot connect to a unix socket without LWP::Protocol::http::SocketUnixAlt installed: ${api}\n";
+            };
+        }
+    } else {
+        die "invalid server url: ${\(defined($api) ? $api : 'undef')}\n";
+    }
+
+    return bless({
+        '_api'           => $api,
+        '_configuration' => $args{'configuration'},
+        '_debug'         => $args{'debug'},
+        '_test'          => $args{'test'},
+    }, $class);
+}
+
+sub run {
+    my $self = shift;
+
+    while (1) {
+        $self->_write("READY\n"); # transition from ACKNOWLEDGED to READY
+
+        try {
+            # header will look something like this:
+            #
+            #   {
+            #       'ver' => '3.0',
+            #       'server' => 'supervisor',
+            #       'pool' => 'test-listener2',
+            #       'eventname' => 'TICK_60',
+            #       'len' => 9,
+            #   }
+            #
+            # event will look something like this:
+            #
+            #   {
+            #       'when' => 1234
+            #   }
+            #
+            my ($raw, $header, $event, $data) = $self->_read_message(*ARGV);
+
+            return try {
+                # MUST get an event name and a pool name
+                die "missing header: ${raw}\n" unless defined($header);
+                die "missing event: ${raw}\n" unless defined($event);
+                die "missing pool name: ${raw}\n" unless defined($header->{'pool'});
+                die "missing event name: ${raw}\n" unless defined($header->{'eventname'});
+
+                # collect pieces
+                my $pool_name = $header->{'pool'};
+                my $event_name = $header->{'eventname'};
+
+                # attempt to run the event
+                $self->handle($pool_name, $event_name, $event, $data);
+
+                return;
+            } catch {
+                my $error = (defined($_) ? $_ : "unknown error");
+                my $error_message = "failed to call event handler: ${error}\n${raw}";
+                $self->_log("ERROR - ${error_message}");
+                return;
+            };
+        } catch {
+            my $error = (defined($_) ? $_ : "unknown error");
+            my $error_message = "error reading from STDIN: ${error}\n";
+            $self->_log("ERROR - ${error_message}");
+
+            # probably best just to restart ourselves if we are having issues with stdin
+            die "${error_message}\n";
+        };
+
+        $self->_write("RESULT 2\nOK"); # transition from READY to ACKNOWLEDGED
+    }
+
+    return 0;
+}
+
+sub handle {
+    my ($self, $pool_name, $event_name, $event, $data) = @_;
+
+    my $now = $event->{'when'};
+    return unless $self->can_handle($pool_name, $event_name, $now);
+
+    # if we've never loaded any events or if sixty seconds have passed since
+    # the last time we loaded crontabs then reload them from disk.
+    if (!$self->{'_loaded'} || $event_name =~ /^TICK_60$/x) {
+        $self->{'_configuration_files'} = {}; # only load each config file once
+        $self->{'_crontabs'} = $self->_load_configuration($self->{'_configuration'});
+        $self->{'_loaded'} = 1;
+
+        if ($self->{'_debug'}) {
+            $self->_log("DEBUG - adding ${\$_->commandLine()} to scheduler") for (@{$self->{'_crontabs'}});
+        }
+    }
+
+    for my $crontab (@{$self->{'_crontabs'}}) {
+        # If one asks a Schedule::Cron::Events object when it will run next and
+        # the time given is exactly when it would run then it will actually
+        # return the NEXT time it would run. For example: A is supposed to run
+        # every sixty seconds and last ran at 1392760640. The time is now
+        # 1392760700. If we ask A when it should run next we would expect it to
+        # say 1392760700, i.e. NOW. But it will actually say 1392760760, i.e.
+        # 60 seconds from now. To work around this, we tell the event that is
+        # actually the current time minus one second.
+        $crontab->setCounterToDate((localtime($now - 1))[0 .. 5]);
+        my $epoch = Time::Local::timelocal($crontab->nextEvent());
+        my $program = $crontab->commandLine();
+        $self->_log("DEBUG - next run for ${program} is ${epoch} and it is currently ${now}") if $self->{'_debug'};
+
+        # if it's supposed to start in the next sixty seconds then start it now
+        if ($epoch >= $now && $epoch < ($now + 60)) {
+            try {
+                $self->_log("INFO - starting ${program} at ${now}");
+                my $results = $self->_start_program($program);
+
+                # even if nothing starts, calls will return a defined array
+                if (defined($results) && ref($results) eq "ARRAY") {
+                    for my $result (@{$results}) {
+                        my $status = $result->{status};
+                        my $program_name = $result->{'group'} . ':' . $result->{'name'};
+                        my $description = $result->{'description'};
+
+                        # 80 is the hardcoded value for success in supervisor
+                        if ($status == 80) {
+                            # success
+                            $self->_log("INFO - starting ${program_name}: ${description}");
+                        } else {
+                            # failures
+                            die "supervisor returned status ${status}: ${description}\n";
+                        }
+                    }
+                } else {
+                    die "unknown result from API call: ${\Data::Dumper::Dumper($results)}\n";
+                }
+                return;
+            } catch {
+                my $error = (defined($_) ? $_ : "unknown error");
+                $self->_log("ERROR - could not start ${program}: ${error}");
+                return;
+            };
+        }
+    }
+
+    return;
+}
+
+# can only handle TICK_60 events because we only check to see if an event
+# should run once per minute.
+sub can_handle {
+    my ($self, $pool_name, $event_name, $now) = @_;
+
+    # need to have a timestamp
+    return 0 unless ($now);
+
+    # make sure we have an event name and a pool name
+    return 0 unless defined($pool_name) && defined($event_name);
+
+    # only process on TICK_60 events. ignore everything else.
+    return 0 unless ($event_name =~ /^TICK_60$/x);
+
+    return 1;
+}
+
+# opens the given configuration and returns a list of Schedule::Cron::Events.
+# this method kind of supports recursive loading and loops are checked but
+# there is no keyword that will cause the recursion.
+sub _load_configuration {
+    my ($self, $configuration) = @_;
+    return unless $configuration;
+    $self->_log("INFO - searching ${configuration} for configurations");
+
+    # an array of hashes representing all of the events found
+    my @events = ();
+
+    # parse the include line
+    my @files = $self->_parse_include($configuration);
+    for my $file (@files) {
+        # only load each config file once
+        next if defined($self->{'_configuration_files'}->{$file});
+        $self->{'_configuration_files'}->{$file} = 1;
+        $self->_log("DEBUG - loading configuration file: ${file}") if $self->{'_debug'};
+
+        # make sure the file we are about to load exists
+        # this can happen when we have invalid symlinks
+        unless (-e $file) {
+            $self->_log("ERROR - invalid configuration: ${file} file does not exist");
+            next;
+        }
+
+        try {
+            open(my $fh, "<", $file) or die "could not open ${file}: $!\n";
+            while (my $line = <$fh>) {
+                chomp($line);
+                $line =~ s/^\s+|\s+$//gx;
+                $line =~ s/[#;].*//gx;
+                next unless length($line);
+
+                try {
+                    my $event = Schedule::Cron::Events->new($line);
+                    die "invalid cron format: ${line}\n" unless defined($event);
+                    push(@events, $event);
+                    return;
+                } catch {
+                    $self->_log("ERROR - invalid cron format: ${file}: ${line}");
+                    return;
+                };
+            }
+            close($fh);
+            return;
+        } catch {
+            my $error = (defined($_) ? $_ : "unknown error");
+            $self->_log("ERROR - invalid configuration: ${file}: ${error}");
+            return;
+        };
+    }
+
+    return \@events;
+}
+
+sub _read_message {
+    my ($self, $handle) = @_;
+
+    my $raw = readline($handle);
+    my $header = $self->_parse_message($raw);
+    my $pool_name = $header->{'pool'};
+    my $event_name = $header->{'eventname'};
+    my $event_length = $header->{'len'};
+
+    # get actual event
+    my $event_data = undef;
+    read($handle, $event_data, $event_length);
+
+    # split the event into two pieces
+    my @pieces = split(/\n/x, $event_data, 2);
+    my $data = $pieces[1];
+    my $event = $self->_parse_message($pieces[0]);
+
+    # add the actual event to the "raw" token
+    $raw .= "\n${event_data}" if defined($event_data);
+
+    return ($raw, $header, $event, $data);
+}
+
+sub _parse_message {
+    my ($self, $message) = @_;
+    return unless defined($message);
+    return unless ($message =~ /[:]/x);
+
+    my $arguments = {};
+
+    my @list = split(/\s+/x, $message);
+    for my $item (@list) {
+        my ($key, $value) = split(/:/x, $item, 2);
+        $arguments->{$key} = $value;
+    }
+
+    return $arguments;
+}
+
+sub _write {
+    my $self = shift;
+    my $message = shift;
+
+    my $handle = IO::Handle->new();
+    $handle->fdopen(fileno(STDOUT), "w");
+    $handle->autoflush();
+    $handle->print($message);
+    $handle->close();
+    return;
+}
+
+sub _log {
+    my $self = shift;
+    my $message = shift;
+
+    $message =~ s/^\s+|\s+$//xsg;
+
+    # prefix all of our log messages with a timestamp
+    my $timestamp = Time::Piece->new->strftime("%Y/%m/%d %H:%M:%S");
+
+    my $handle = IO::Handle->new();
+    $handle->fdopen(fileno(STDERR), "w");
+    $handle->autoflush();
+    $handle->print("${timestamp} - ${message}\n");
+    $handle->close();
+    return;
+}
+
+# takes a file list or pattern and turns it into a list of absolute paths
+#
+# for example:
+#     '~/foo'        -> [ '/home/plockaby/foo' ]
+#     '/foo*'        -> [ '/foo1', '/foo2' ]
+#     '~/foo#'       -> [ '/home/plockaby/foo1', '/home/plockaby/foo2' ]
+#     '/foo.{c,h,y}' -> [ '/foo.c', '/foo.y', '/foo.h' ]
+#
+## no critic (ProhibitUnusedPrivateSubroutines)
+sub _parse_include {
+    my ($self, $line) = @_;
+
+    my $cwd = Cwd::getcwd();
+    my @paths = split(/\s+/x, $line);
+
+    my @files = ();
+    for my $path (@paths) {
+        if ($path =~ /[\\\[\]\{\}\*\?\~]/x) {
+            try {
+                push(@files, sort map { File::Spec->rel2abs($_, $cwd) } glob($path));
+            } catch {
+                $self->_log("ERROR - could not read ${path}: " . (defined($_) ? $_ : 'unknown error'));
+            };
+        } else {
+            try {
+                push(@files, File::Spec->rel2abs($path, $cwd));
+            } catch {
+                $self->_log("ERROR - could not read ${path}: " . (defined($_) ? $_ : 'unknown error'));
+            };
+        }
+    }
+
+    return wantarray ? @files : \@files;
+}
+
+sub _get_supervisor_api_version {
+    my ($self) = @_;
+    my $server = XML::RPC->new($self->{'_api'});
+    return $server->call('supervisor.getAPIVersion');
+}
+
+sub _get_program_info {
+    my ($self, $process_name) = @_;
+    my $server = XML::RPC->new($self->{'_api'});
+
+    # make sure we are communicating with a protocol version 3.0 server
+    my $version = try {
+        my $x = $self->_get_supervisor_api_version();
+        die "supervisor protocol version 3.0 is required but server is running version ${\($x // '(undef)')}\n" unless (defined($x) && $x eq "3.0");
+        return $x;
+    } catch {
+        my $error = (defined($_) ? $_ : "unknown error");
+        die "not able to communicate with ${\$self->{'_api'}}: ${error}\n";
+    };
+
+    return try {
+        my $status = $server->call('supervisor.getProcessInfo', $process_name);
+        die "could not get process information for ${process_name}\n" unless (defined($status) && ref($status) && ref($status) eq 'HASH' && defined($status->{'pid'}));
+        return $status;
+    } catch {
+        my $error = (defined($_) ? $_ : "unknown error");
+        die "not able to get process information for ${process_name}: ${error}\n";
+    };
+}
+
+sub _start_program {
+    my ($self, $process_name) = @_;
+    my $server = XML::RPC->new($self->{'_api'});
+
+    # make sure we are communicating with a protocol version 3.0 server
+    my $version = try {
+        my $x = $self->_get_supervisor_api_version();
+        die "supervisor protocol version 3.0 is required but server is running version ${\($x // '(undef)')}\n" unless (defined($x) && $x eq "3.0");
+        return $x;
+    } catch {
+        my $error = (defined($_) ? $_ : "unknown error");
+        die "not able to communicate with ${\$self->{'_api'}}: ${error}\n";
+    };
+
+    # see if it is already started
+    my $status = $self->_get_program_info($process_name);
+    die "received undefined process status for ${process_name}\n" unless defined($status);
+    die "received unparseable process status for ${process_name}\n" unless (ref($status) && ref($status) eq 'HASH');
+
+    # if the process is already running that is ok
+    if (defined($status->{'pid'}) && $status->{'pid'} != 0) {
+        # this error should be caught by the calling program
+        die "process ${process_name} is already running with pid ${\$status->{'pid'}}\n";
+    }
+
+    return try {
+        # ok actually start it
+        return $server->call('supervisor.startProcessGroup', $process_name);
+    } catch {
+        my $error = (defined($_) ? $_ : "unknown error");
+        die "not able to start ${process_name}: ${error}\n";
+    };
+}
+
+1;
+
+=head1 NAME
+
+supercron
+
+=head1 USAGE
+
+    supercron --configuration=/path/to/configuration
+
+=head1 DESCRIPTION
+
+This program functions like cron but will instead start programs controlled by
+supervisor. Event precision is 60 seconds meaning that it can only run a
+program as often as every 60 seconds. Configuring C<supercron> is very familiar.
+In this example, "foo1" will run every minute, "foo2" will run every five
+minutes, and "foo3" will run at the top of every hour:
+
+    * * * * * foo1
+    */5 * * * * foo2
+    0 * * * * foo3
+
+The only difference is that "foo1", "foo2" and "foo3" are configure dprogram
+names in supervisor rather than actual commands. Changes in crontabs are picked
+up automatically and do not require a restart.
+
+To get C<supercron> running you might configure it like this:
+
+    [eventlistener:supercron]
+    command = /usr/local/bin/supercron --configuration=/etc/supervisor/supercron.d/%(host_node_name)s/*.crontab
+    events = TICK
+    buffer_size = 0
+    autostart = true
+    autorestart = true
+    stopsignal = INT
+    stdout_logfile = /var/log/supervisor/supercron.log
+    stdout_logfile_maxbytes = 10MB
+    stdout_logfile_backups = 4
+    stderr_logfile = /var/log/supervisor/supercron.err
+    stderr_logfile_maxbytes = 10MB
+    stderr_logfile_backups = 4
+
+It is very importat that the buffer size be zero. Otherwise, if C<supercron> is
+stopped for any reason then TICK events will queue until C<supercron> is
+started again and programs that should have run in the time that C<supercron>
+was not running will all run when C<supercron> starts again. So if C<supercron>
+is stopped for five minutes and a program is configured to run every minute, it
+will be started five times as soon as C<supercron> starts again. This is not
+what you want. Turning off the buffer prevents this behavior.
+
+To configuration of a program to managed by C<supercron> is slightly different.
+Here is an example configuration:
+
+    [program:periodic-prog]
+    command = /usr/local/bin/periodic-prog
+    process_name = %(program_name)s
+    user = nobody
+    autostart = false
+    autorestart = false
+    startsecs = 0
+    startretries = 0
+    stopsignal = TERM
+    stdout_logfile = /var/log/supervisor/periodic-prog.log
+    stdout_logfile_maxbytes = 10MB
+    stdout_logfile_backups = 4
+    stderr_logfile = /var/log/supervisor/periodic-prog.err
+    stderr_logfile_maxbytes = 10MB
+    stderr_logfile_backups = 4
+
+Note the differences are that this program is not configured to start or
+restart automatically. It will only be started by C<supercron> -- or manually
+by an administrator. Additionally, it will not try to start the program again
+if it fails to start (startretries = 0) and it will not wait to see if the
+program continues to run after starting it (startsecs = 0). All other
+configuration options are identical to a normal program.
+
+Finally, C<supercron> monitors its version number and will automatically reload
+itself when it finds that it has been replaced with a newer version.
+
+=head1 OPTIONS
+
+=over
+
+=item --configuration
+
+REQUIRED: The full path to the crontab file that will configure C<supercron>.
+If this is a glob then it will load all the crontab files that match.
+
+=item --debug
+
+Enable debugging output.
+
+=item --help
+
+Shows this message.
+
+=back
+
+=head1 AUTHOR
+
+Paul Lockaby <paul@paullockaby.com>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2015, 2016 Paul Lockaby, University of Washington. All rights
+reserved.
+
+This program is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself. The full text of this license can be found in
+the LICENSE file included with this module.
+
+=cut
