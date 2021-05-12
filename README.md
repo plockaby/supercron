@@ -91,15 +91,8 @@ normal program.
 
     Shows this message.
 
-# AUTHOR
-
-Paul Lockaby <paul@paullockaby.com>
-
 # COPYRIGHT
 
-Copyright (c) 2015, 2016 Paul Lockaby, University of Washington. All rights
-reserved.
-
-This program is free software; you can redistribute it and/or modify it under
-the same terms as Perl itself. The full text of this license can be found in
-the LICENSE file included with this module.
+This project is a derivation of a similar project created and used internally
+by the University of Washington Information Technology Computing Infrastructure
+division. The code seen here was created by Paul Lockaby.
